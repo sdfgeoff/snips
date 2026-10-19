@@ -37,7 +37,6 @@ cargo test --offline
 cargo clippy --offline -- -D warnings
 ```
 
-The installed `~/bin/snips` symlink points to `target/release/snips`, so rebuilding
-updates the command. Runtime dependencies are the X11 server and `xclip`;
+Runtime dependencies are the X11 server and `xclip`;
 `notify-send` is optional for error notifications. The build uses cached Rust
 crates and needs no additional system packages.
