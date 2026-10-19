@@ -1,0 +1,14 @@
+[package]
+name = "snips"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+x11rb = "0.13.2"
+png = "0.17.16"
+tempfile = "3.27.0"
+chrono = "0.4.45"
+
+[profile.release]
+strip = true
+lto = true
