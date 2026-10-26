@@ -11,6 +11,8 @@ use x11rb::{
     CURRENT_TIME,
 };
 
+mod editor;
+
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,7 +50,7 @@ fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            println!("snips [--directory PATH]\nDrag to capture; Escape or right-click cancels.\nSaves a PNG in ~/tmp and copies the image to the X11 clipboard.");
+            println!("snips [--directory PATH]\nDrag to select, then annotate. Enter saves; Escape or right-click cancels.\nSaves a PNG in ~/tmp and copies the image to the X11 clipboard.");
             return Ok(());
         } else if arg == "--directory" {
             output = args.next().ok_or("--directory needs a path")?.into();
@@ -180,12 +182,17 @@ fn run() -> Result<()> {
     for win in borders {
         conn.destroy_window(win)?;
     }
+    conn.flush()?;
+    let annotated = match selected {
+        Some(r) => editor::annotate(&conn, screen, &snapshot, r, &mapping)?,
+        None => None,
+    };
     conn.ungrab_pointer(CURRENT_TIME)?;
     conn.ungrab_keyboard(CURRENT_TIME)?;
     conn.free_cursor(cursor)?;
     conn.close_font(font)?;
     conn.flush()?;
-    let Some(r) = selected else {
+    let (Some(r), Some(snapshot)) = (selected, annotated) else {
         return Ok(());
     };
     let format = conn
@@ -205,13 +212,10 @@ fn run() -> Result<()> {
     }
     let bytes = usize::from(format.bits_per_pixel).div_ceil(8);
     let pad = usize::from(format.scanline_pad);
-    let stride = (usize::from(screen.width_in_pixels) * usize::from(format.bits_per_pixel))
-        .div_ceil(pad)
-        * pad
-        / 8;
+    let stride = (usize::from(r.w) * usize::from(format.bits_per_pixel)).div_ceil(pad) * pad / 8;
     let mut rgb = Vec::with_capacity(usize::from(r.w) * usize::from(r.h) * 3);
-    for y in r.y as usize..r.y as usize + usize::from(r.h) {
-        for x in r.x as usize..r.x as usize + usize::from(r.w) {
+    for y in 0..usize::from(r.h) {
+        for x in 0..usize::from(r.w) {
             let offset = y * stride + x * bytes;
             let mut pixel = 0u32;
             for (i, &b) in snapshot.data[offset..offset + bytes].iter().enumerate() {
