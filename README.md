@@ -6,13 +6,14 @@ Run `~/bin/snips` (or press Print Screen), then hold the left mouse button
 and drag over the area you want. Releasing opens an annotation overlay directly
 on the screen, with the selected region bright and the surroundings dimmed.
 
-Use the toolbar beneath the selection to choose a pen, arrow, rectangle, text,
-or highlighter. Pick a color, click the line-width control to cycle through
+Use the icon toolbar beneath the selection to choose a pen, arrow, rectangle,
+text, or highlighter. Hover over a control to see its name and shortcut. Pen,
+arrow, and rectangle edges are antialiased in both the preview and saved PNG. Pick a color, click the line-width control to cycle through
 3, 6, and 10 pixels, and use Undo to remove the last annotation. The toolbar
 stays on the selection's monitor and moves above the region when needed. For
 a selection that fills the screen, it sits inside the frame.
 
-Press **Enter** or click **Accept** to save the annotated PNG in `~/tmp` and copy
+Press **Enter** or click **Save** to save the annotated PNG in `~/tmp` and copy
 the image to the clipboard. To save without annotations, press Enter immediately
 after selecting. **Escape**, right-click, or the toolbar's **Esc** button cancels
 without saving or changing the clipboard. A zero-sized selection also cancels.
@@ -58,5 +59,5 @@ cargo clippy --offline -- -D warnings
 
 Runtime dependencies are the X11 server and `xclip`;
 `notify-send` is optional for error notifications. Text uses the installed
-DejaVu Sans font at `/usr/share/fonts/TTF/DejaVuSans.ttf`. The overlay uses native
-X11 drawing and Rust font rasterization; it needs no GUI toolkit.
+DejaVu Sans font at `/usr/share/fonts/TTF/DejaVuSans.ttf`. The overlay uses X11 with
+Rust vector and font rasterization; it needs no GUI toolkit.

@@ -1,7 +1,8 @@
 //! In-place annotation. The canvas pixmap contains only exportable pixels;
 //! the frame and toolbar are drawn separately on the overlay window.
-use crate::{Region, Result};
+use crate::{graphics, Region, Result};
 use std::{cell::RefCell, collections::HashMap};
+use tiny_skia::{PathBuilder, Pixmap as Raster, Transform};
 type GlyphCache = RefCell<HashMap<(char, u16), (fontdue::Metrics, Vec<u8>)>>;
 use x11rb::{
     connection::Connection,
@@ -83,6 +84,7 @@ struct Editor<'a> {
     conn: &'a RustConnection,
     screen: &'a Screen,
     window: Window,
+    surface: Pixmap,
     original: Pixmap,
     background: Pixmap,
     canvas: Pixmap,
@@ -98,6 +100,7 @@ struct Editor<'a> {
     color: u32,
     width: u16,
     visual: Visualtype,
+    hover: Option<usize>,
 }
 
 pub(super) fn annotate(
@@ -122,8 +125,10 @@ pub(super) fn annotate(
     let original = conn.generate_id()?;
     let background = conn.generate_id()?;
     let canvas = conn.generate_id()?;
+    let surface = conn.generate_id()?;
     for (id, w, h) in [
         (original, screen.width_in_pixels, screen.height_in_pixels),
+        (surface, screen.width_in_pixels, screen.height_in_pixels),
         (background, screen.width_in_pixels, screen.height_in_pixels),
         (canvas, r.w, r.h),
     ] {
@@ -215,6 +220,7 @@ pub(super) fn annotate(
         conn,
         screen,
         window,
+        surface,
         original,
         background,
         canvas,
@@ -230,6 +236,7 @@ pub(super) fn annotate(
         color: COLORS[0],
         width: 3,
         visual,
+        hover: None,
     };
     editor.repaint(true)?;
     let accepted = editor.events(mapping)?;
@@ -243,7 +250,7 @@ pub(super) fn annotate(
         None
     };
     conn.destroy_window(window)?;
-    for pixmap in [original, background, canvas] {
+    for pixmap in [original, background, canvas, surface] {
         conn.free_pixmap(pixmap)?;
     }
     conn.free_gc(gc)?;
@@ -475,30 +482,151 @@ impl Editor<'_> {
         Ok(())
     }
 
-    fn line(&self, drawable: Drawable, points: &[Point], color: u32, width: u16) -> Result<()> {
-        self.paint(color, width)?;
-        // Each request is bounded; overlap endpoints to preserve long freehand strokes.
-        for start in (0..points.len().saturating_sub(1)).step_by(16000) {
-            let chunk = &points[start..(start + 16001).min(points.len())];
-            self.conn
-                .poly_line(CoordMode::ORIGIN, drawable, self.gc, chunk)?;
+    // Composite premultiplied RGBA pixels onto an X11 drawable. Reading its
+    // actual background keeps edge coverage correct over screenshots and marks.
+    fn composite(&self, drawable: Drawable, x: i16, y: i16, overlay: &Raster) -> Result<()> {
+        let (limit_w, limit_h) = if drawable == self.canvas {
+            (self.r.w, self.r.h)
+        } else {
+            (self.screen.width_in_pixels, self.screen.height_in_pixels)
+        };
+        let left = i32::from(x).max(0);
+        let top = i32::from(y).max(0);
+        let right = (i32::from(x) + overlay.width() as i32).min(i32::from(limit_w));
+        let bottom = (i32::from(y) + overlay.height() as i32).min(i32::from(limit_h));
+        if right <= left || bottom <= top {
+            return Ok(());
         }
-        if points.len() == 1 {
-            let p = points[0];
-            self.conn.poly_fill_arc(
+        let (w, h) = ((right - left) as u16, (bottom - top) as u16);
+        let mut image = self
+            .conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                drawable,
+                left as i16,
+                top as i16,
+                w,
+                h,
+                u32::MAX,
+            )?
+            .reply()?;
+        let format = self
+            .conn
+            .setup()
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == image.depth)
+            .ok_or("unsupported image format")?;
+        let bytes = usize::from(format.bits_per_pixel).div_ceil(8);
+        let stride = (usize::from(w) * usize::from(format.bits_per_pixel))
+            .div_ceil(usize::from(format.scanline_pad))
+            * usize::from(format.scanline_pad)
+            / 8;
+        let little = self.conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
+        for dy in 0..usize::from(h) {
+            for dx in 0..usize::from(w) {
+                let p = overlay
+                    .pixel(
+                        (left - i32::from(x)) as u32 + dx as u32,
+                        (top - i32::from(y)) as u32 + dy as u32,
+                    )
+                    .unwrap();
+                let alpha = u32::from(p.alpha());
+                if alpha == 0 {
+                    continue;
+                }
+                let offset = dy * stride + dx * bytes;
+                let pixel = &mut image.data[offset..offset + bytes];
+                let mut value = 0u32;
+                for (i, &b) in pixel.iter().enumerate() {
+                    value |= u32::from(b) << (if little { i } else { bytes - 1 - i } * 8);
+                }
+                for (src, mask) in [
+                    (p.red(), self.visual.red_mask),
+                    (p.green(), self.visual.green_mask),
+                    (p.blue(), self.visual.blue_mask),
+                ] {
+                    let shift = mask.trailing_zeros();
+                    let max = mask >> shift;
+                    let dst = (value & mask) >> shift;
+                    let blended =
+                        (u32::from(src) * max / 255 + (dst * (255 - alpha) + 127) / 255).min(max);
+                    value = (value & !mask) | (blended << shift);
+                }
+                for (i, b) in pixel.iter_mut().enumerate() {
+                    *b = (value >> (if little { i } else { bytes - 1 - i } * 8)) as u8;
+                }
+            }
+        }
+        self.paint(0xffffff, 1)?;
+        let rows = (240_000 / stride).max(1);
+        for (i, data) in image.data.chunks(rows * stride).enumerate() {
+            self.conn.put_image(
+                ImageFormat::Z_PIXMAP,
                 drawable,
                 self.gc,
-                &[Arc {
-                    x: p.x - width as i16 / 2,
-                    y: p.y - width as i16 / 2,
-                    width,
-                    height: width,
-                    angle1: 0,
-                    angle2: 360 * 64,
-                }],
+                w,
+                (data.len() / stride) as u16,
+                left as i16,
+                (top + (i * rows) as i32) as i16,
+                0,
+                image.depth,
+                data,
             )?;
         }
         Ok(())
+    }
+
+    fn line(&self, drawable: Drawable, points: &[Point], color: u32, width: u16) -> Result<()> {
+        let mut p = PathBuilder::new();
+        if let Some(a) = points.first() {
+            p.move_to(f32::from(a.x), f32::from(a.y));
+            for b in &points[1..] {
+                p.line_to(f32::from(b.x), f32::from(b.y));
+            }
+            // Tiny-skia needs a nonzero segment to render a round dot.
+            if points.iter().all(|b| b.x == a.x && b.y == a.y) {
+                p.line_to(f32::from(a.x) + 0.01, f32::from(a.y));
+            }
+            if let Some(path) = p.finish() {
+                self.path(drawable, &path, color, width)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn path(
+        &self,
+        drawable: Drawable,
+        path: &tiny_skia::Path,
+        color: u32,
+        width: u16,
+    ) -> Result<()> {
+        let pad = f32::from(width) / 2.0 + 2.0;
+        let bounds = path.bounds();
+        let (w, h) = if drawable == self.canvas {
+            (self.r.w, self.r.h)
+        } else {
+            (self.screen.width_in_pixels, self.screen.height_in_pixels)
+        };
+        let x = (bounds.left() - pad).floor().max(0.) as i16;
+        let y = (bounds.top() - pad).floor().max(0.) as i16;
+        let right = (bounds.right() + pad).ceil().min(f32::from(w));
+        let bottom = (bounds.bottom() + pad).ceil().min(f32::from(h));
+        if right <= f32::from(x) || bottom <= f32::from(y) {
+            return Ok(());
+        }
+        let mut image = Raster::new(
+            (right - f32::from(x)) as u32,
+            (bottom - f32::from(y)) as u32,
+        )
+        .ok_or("stroke too large")?;
+        let local = path
+            .clone()
+            .transform(Transform::from_translate(-f32::from(x), -f32::from(y)))
+            .ok_or("invalid stroke")?;
+        graphics::stroke(&mut image, &local, color, f32::from(width));
+        self.composite(drawable, x, y, &image)
     }
 
     fn mark(&self, m: &Mark) -> Result<()> {
@@ -533,18 +661,15 @@ impl Editor<'_> {
                 self.line(self.canvas, &[head(0.5), b, head(-0.5)], m.color, m.width)?;
             }
             Tool::Box => {
-                self.paint(m.color, m.width)?;
                 let r = crate::region((a.x, a.y), (b.x, b.y));
-                self.conn.poly_rectangle(
-                    self.canvas,
-                    self.gc,
-                    &[Rectangle {
-                        x: r.x,
-                        y: r.y,
-                        width: r.w,
-                        height: r.h,
-                    }],
-                )?;
+                if let Some(rect) = tiny_skia::Rect::from_xywh(
+                    f32::from(r.x),
+                    f32::from(r.y),
+                    f32::from(r.w),
+                    f32::from(r.h),
+                ) {
+                    self.path(self.canvas, &PathBuilder::from_rect(rect), m.color, m.width)?;
+                }
             }
             Tool::Text => self.text(self.canvas, a.x, a.y, &m.text, m.color, 24)?,
         }
@@ -576,7 +701,7 @@ impl Editor<'_> {
         if full {
             self.conn.copy_area(
                 self.background,
-                self.window,
+                self.surface,
                 self.gc,
                 0,
                 0,
@@ -589,7 +714,7 @@ impl Editor<'_> {
         self.render_canvas()?;
         self.conn.copy_area(
             self.canvas,
-            self.window,
+            self.surface,
             self.gc,
             0,
             0,
@@ -606,7 +731,7 @@ impl Editor<'_> {
                 .sum();
             let x = (f32::from(self.r.x + p.x) + advance).round() as i16;
             self.line(
-                self.window,
+                self.surface,
                 &[
                     Point {
                         x,
@@ -623,7 +748,7 @@ impl Editor<'_> {
         }
         self.paint(0x57d7f0, 1)?;
         self.conn.poly_rectangle(
-            self.window,
+            self.surface,
             self.gc,
             &[Rectangle {
                 x: self.r.x,
@@ -642,88 +767,213 @@ impl Editor<'_> {
             ),
         ] {
             if self.r.w >= 6 && self.r.h >= 6 {
-                self.rect(self.window, x, y, 6, 6, 0x57d7f0)?;
+                self.rect(self.surface, x, y, 6, 6, 0x57d7f0)?;
             }
         }
-        let (x, y) = (self.bar.x, self.bar.y);
-        self.rect(self.window, x, y, BAR_W, BAR_H, 0x20252d)?;
-        for (i, (tool, label)) in [
-            (Tool::Pen, b"Pen".as_slice()),
-            (Tool::Arrow, b"Arrow"),
-            (Tool::Box, b"Box"),
-            (Tool::Text, b"Text"),
-            (Tool::Highlight, b"Mark"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let bx = x + 8 + i as i16 * 42;
-            if self.tool == *tool {
-                self.rect(self.window, bx, y + 8, 40, 38, 0x405466)?;
-            }
-            let advance: f32 = String::from_utf8_lossy(label)
-                .chars()
-                .map(|ch| self.typeface.metrics(ch, 13.0).advance_width)
-                .sum();
-            self.text(
+        self.toolbar()?;
+        // Present a completed frame in one operation to avoid toolbar flicker.
+        if full {
+            self.conn.copy_area(
+                self.surface,
                 self.window,
-                bx + 20 - (advance / 2.0).round() as i16,
-                y + 31,
-                label,
-                0xffffff,
-                13,
+                self.gc,
+                0,
+                0,
+                0,
+                0,
+                self.screen.width_in_pixels,
+                self.screen.height_in_pixels,
+            )?;
+        } else {
+            self.conn.copy_area(
+                self.surface,
+                self.window,
+                self.gc,
+                self.r.x,
+                self.r.y,
+                self.r.x,
+                self.r.y,
+                self.r.w,
+                self.r.h,
+            )?;
+            self.conn.copy_area(
+                self.surface,
+                self.window,
+                self.gc,
+                self.bar.x,
+                self.bar.y,
+                self.bar.x,
+                self.bar.y,
+                BAR_W,
+                BAR_H + 20,
             )?;
         }
-        for (i, &color) in COLORS.iter().enumerate() {
-            let bx = x + 230 + i as i16 * 28;
-            self.rect(self.window, bx + 4, y + 18, 18, 18, color)?;
-            if self.color == color {
-                self.paint(0xffffff, 1)?;
-                self.conn.poly_rectangle(
-                    self.window,
-                    self.gc,
-                    &[Rectangle {
-                        x: bx + 1,
-                        y: y + 15,
-                        width: 24,
-                        height: 24,
-                    }],
-                )?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn toolbar(&self) -> Result<()> {
+        let (x, y) = (self.bar.x, self.bar.y);
+        // Restore pixels under rounded corners, including an overlapping crop.
+        self.conn.copy_area(
+            self.background,
+            self.surface,
+            self.gc,
+            x,
+            y,
+            x,
+            y,
+            BAR_W,
+            BAR_H,
+        )?;
+        let left = i32::from(x).max(i32::from(self.r.x));
+        let top = i32::from(y).max(i32::from(self.r.y));
+        let right =
+            (i32::from(x) + i32::from(BAR_W)).min(i32::from(self.r.x) + i32::from(self.r.w));
+        let bottom =
+            (i32::from(y) + i32::from(BAR_H)).min(i32::from(self.r.y) + i32::from(self.r.h));
+        if right > left && bottom > top {
+            self.conn.copy_area(
+                self.canvas,
+                self.surface,
+                self.gc,
+                (left - i32::from(self.r.x)) as i16,
+                (top - i32::from(self.r.y)) as i16,
+                left as i16,
+                top as i16,
+                (right - left) as u16,
+                (bottom - top) as u16,
+            )?;
+        }
+        let mut image = Raster::new(u32::from(BAR_W), u32::from(BAR_H)).unwrap();
+        let outer =
+            graphics::round_rect(0.5, 0.5, f32::from(BAR_W) - 1., f32::from(BAR_H) - 1., 13.);
+        graphics::fill(&mut image, &outer, 0x202630);
+        graphics::stroke(&mut image, &outer, 0x46505e, 1.);
+        for i in [0, 1, 2, 3, 4, 11, 12, 13, 14] {
+            let (bx, w) = match i {
+                0..=4 => (8. + i as f32 * 42., 40.),
+                11 => (410., 62.),
+                12 => (480., 58.),
+                13 => (548., 52.),
+                _ => (610., 128.),
+            };
+            let selected = i < 5
+                && self.tool
+                    == [
+                        Tool::Pen,
+                        Tool::Arrow,
+                        Tool::Box,
+                        Tool::Text,
+                        Tool::Highlight,
+                    ][i];
+            let hovered = self.hover == Some(i);
+            let button = graphics::round_rect(bx, 8., w, 38., 8.);
+            if i == 14 {
+                graphics::fill(
+                    &mut image,
+                    &button,
+                    if hovered { 0x20a96c } else { 0x168653 },
+                );
+            } else if selected || hovered {
+                graphics::fill(
+                    &mut image,
+                    &button,
+                    if selected { 0x284c59 } else { 0x343e4b },
+                );
+                if selected {
+                    graphics::stroke(&mut image, &button, 0x53c9de, 1.);
+                }
+            }
+            let color = if i == 12 && self.marks.is_empty() {
+                0x657183
+            } else if selected {
+                0x88e8f4
+            } else {
+                0xe3e9f0
+            };
+            if i < 5 {
+                graphics::icon(&mut image, i, bx + 8., 15., color);
+            } else if i == 12 || i == 13 {
+                graphics::icon(&mut image, i, bx + (w - 24.) / 2., 14., color);
+            } else if i == 14 {
+                graphics::icon(&mut image, i, bx + 5., 15., 0xffffff);
             }
         }
-        self.text(
-            self.window,
-            x + 418,
-            y + 31,
-            format!("{} px", self.width).as_bytes(),
-            0xffffff,
-            13,
-        )?;
-        self.text(
-            self.window,
-            x + 487,
-            y + 31,
-            b"Undo",
-            if self.marks.is_empty() {
-                0x78818d
+        for bx in [224., 404., 476., 542., 604.] {
+            let mut p = PathBuilder::new();
+            p.move_to(bx, 17.);
+            p.line_to(bx, 37.);
+            graphics::stroke(&mut image, &p.finish().unwrap(), 0x414b59, 1.);
+        }
+        for (i, &color) in COLORS.iter().enumerate() {
+            let cx = 243. + i as f32 * 28.;
+            if self.color == color {
+                let ring = PathBuilder::from_circle(cx, 27., 12.).unwrap();
+                graphics::stroke(&mut image, &ring, 0xeaf1f8, 1.5);
+            } else if self.hover == Some(i + 5) {
+                graphics::circle(&mut image, cx, 27., 12., 0x4c596a);
+            }
+            graphics::circle(&mut image, cx, 27., 9., color);
+            if i == 5 {
+                graphics::stroke(
+                    &mut image,
+                    &PathBuilder::from_circle(cx, 27., 9.).unwrap(),
+                    0x8b96a5,
+                    1.,
+                );
+            }
+        }
+        // A line sample makes the thickness control recognizable without a label.
+        let mut sample = PathBuilder::new();
+        sample.move_to(419., 27.);
+        sample.line_to(435., 27.);
+        graphics::stroke(
+            &mut image,
+            &sample.finish().unwrap(),
+            0xdce5ef,
+            f32::from(self.width).min(6.),
+        );
+        graphics::fill(
+            &mut image,
+            &graphics::round_rect(686., 16., 44., 23., 5.),
+            if self.hover == Some(14) {
+                0x17804f
             } else {
-                0xffffff
+                0x116d43
             },
-            13,
+        );
+        self.composite(self.surface, x, y, &image)?;
+        self.text(
+            self.surface,
+            x + 443,
+            y + 32,
+            format!("{}", self.width).as_bytes(),
+            0xe3e9f0,
+            14,
         )?;
-        self.text(self.window, x + 558, y + 31, b"Esc", 0xffffff, 13)?;
-        self.rect(self.window, x + 610, y + 8, 128, 38, 0x13894d)?;
-        self.text(self.window, x + 621, y + 31, b"Accept  Enter", 0xffffff, 13)?;
-        let hint = if self.tool == Tool::Text {
-            b"Click to place text. Type, then Enter to finish text. Enter again saves.".as_slice()
-        } else {
-            b"Draw to annotate | Enter: save & copy | Ctrl+Z: undo | Esc: cancel"
+        self.text(self.surface, x + 646, y + 32, b"Save", 0xffffff, 14)?;
+        self.text(self.surface, x + 692, y + 31, b"Enter", 0xe2f9ed, 11)?;
+        let hint = match self.hover {
+            Some(0) => "Pen · P",
+            Some(1) => "Arrow · A",
+            Some(2) => "Rectangle · R",
+            Some(3) => "Text · T",
+            Some(4) => "Highlighter · H",
+            Some(5..=10) => "Choose an annotation color",
+            Some(11) => "Line width · click to cycle 3 / 6 / 10 px",
+            Some(12) => "Undo · Ctrl+Z     Redo · Ctrl+Shift+Z",
+            Some(13) => "Cancel · Escape",
+            Some(14) => "Save PNG and copy image to clipboard · Enter",
+            _ if self.tool == Tool::Text => {
+                "Click to place text · Type · Enter to finish · Enter again to save"
+            }
+            _ => "Draw to annotate     Enter to save & copy     Esc to cancel",
         };
-        // Clear the hint strip before drawing a new hint.
         if i32::from(y) + i32::from(BAR_H) + 20 <= i32::from(self.screen.height_in_pixels) {
             self.conn.copy_area(
                 self.background,
-                self.window,
+                self.surface,
                 self.gc,
                 x,
                 y + BAR_H as i16,
@@ -732,16 +982,19 @@ impl Editor<'_> {
                 BAR_W,
                 20,
             )?;
+            let advance: f32 = hint
+                .chars()
+                .map(|ch| self.typeface.metrics(ch, 12.).advance_width)
+                .sum();
             self.text(
-                self.window,
-                x + 6,
-                y + BAR_H as i16 + 14,
-                hint,
-                0xd9dde3,
-                13,
+                self.surface,
+                x + ((f32::from(BAR_W) - advance) / 2.).round() as i16,
+                y + BAR_H as i16 + 16,
+                hint.as_bytes(),
+                0xd0d8e2,
+                12,
             )?;
         }
-        self.conn.flush()?;
         Ok(())
     }
 
@@ -769,10 +1022,20 @@ impl Editor<'_> {
     }
 
     fn events(&mut self, mapping: &GetKeyboardMappingReply) -> Result<bool> {
+        let mut pending = None;
+        let mut dirty = false;
+        let mut full = false;
+        let mut last_frame = std::time::Instant::now();
         loop {
-            let event = self.conn.wait_for_event()?;
+            let event = match pending.take() {
+                Some(event) => event,
+                None => self.conn.wait_for_event()?,
+            };
             match event {
-                Event::Expose(e) if e.count == 0 => self.repaint(true)?,
+                Event::Expose(e) if e.count == 0 => {
+                    full = true;
+                    dirty = true;
+                }
                 Event::KeyPress(e) => {
                     let index = usize::from(e.detail - self.conn.setup().min_keycode)
                         * usize::from(mapping.keysyms_per_keycode);
@@ -831,7 +1094,7 @@ impl Editor<'_> {
                             _ => {}
                         }
                     }
-                    self.repaint(false)?;
+                    dirty = true;
                 }
                 Event::ButtonPress(e) if e.detail == 3 => return Ok(false),
                 Event::ButtonPress(e) if e.detail == 1 => {
@@ -877,7 +1140,7 @@ impl Editor<'_> {
                             text: Vec::new(),
                         });
                     }
-                    self.repaint(false)?;
+                    dirty = true;
                 }
                 Event::MotionNotify(e) if e.state.contains(KeyButMask::BUTTON1) => {
                     let point = self.point(e.root_x, e.root_y);
@@ -893,8 +1156,15 @@ impl Editor<'_> {
                             {
                                 mark.points.push(point);
                             }
-                            self.repaint(false)?;
+                            dirty = true;
                         }
+                    }
+                }
+                Event::MotionNotify(e) => {
+                    let hover = self.bar.hit(e.root_x, e.root_y);
+                    if hover != self.hover {
+                        self.hover = hover;
+                        dirty = true;
                     }
                 }
                 Event::ButtonRelease(e) if e.detail == 1 => {
@@ -906,10 +1176,19 @@ impl Editor<'_> {
                         }
                         mark.points.push(point);
                         self.finish();
-                        self.repaint(false)?;
+                        dirty = true;
                     }
                 }
                 _ => {}
+            }
+            // Process queued input before painting, retaining every pen point and
+            // keystroke while avoiding a render for every individual event.
+            pending = self.conn.poll_for_event()?;
+            if dirty && (pending.is_none() || last_frame.elapsed().as_millis() >= 16) {
+                self.repaint(full)?;
+                dirty = false;
+                full = false;
+                last_frame = std::time::Instant::now();
             }
         }
     }

@@ -12,6 +12,7 @@ use x11rb::{
 };
 
 mod editor;
+mod graphics;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
