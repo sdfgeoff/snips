@@ -106,6 +106,13 @@ pub fn icon(image: &mut Pixmap, id: usize, x: f32, y: f32, color: u32) {
             p.move_to(4., 22.);
             p.line_to(18., 22.);
         }
+        15 => {
+            p.move_to(5., 3.);
+            p.line_to(19., 13.);
+            p.line_to(12., 14.);
+            p.line_to(9., 21.);
+            p.close();
+        }
         12 => {
             p.move_to(5., 9.);
             p.line_to(15., 9.);
